@@ -129,7 +129,7 @@ async function registerNode(token, proxy = null) {
 }
 
 async function confirmUser(token) {
-    const confirm = await fetch("https://api.mygate.network/api/front/referrals/referral/LfBWAQ?", {
+    const confirm = await fetch("https://api.mygate.network/api/front/referrals/referral/40gNab?", {
         method: "POST",
         headers: {
             "Authorization": `Bearer ${token}`,
