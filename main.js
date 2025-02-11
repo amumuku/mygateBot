@@ -1,10 +1,28 @@
 import WebSocket from 'ws';
-import fetch from 'node-fetch';
+import axios from 'axios';
 import { randomUUID } from 'crypto';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import fs from 'fs';
 import log from './utils/logger.js';
 import bedduSalama from './utils/banner.js';
+import getSignature from './utils/sign.js';
+
+const headers = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+    "Origin": "https://app.mygate.network",
+    "Priority": "u=1, i",
+    "Referer": "https://app.mygate.network/",
+    "Sec-CH-UA": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+};
 
 function readFile(pathFile) {
     try {
@@ -17,39 +35,77 @@ function readFile(pathFile) {
         log.error(`Error reading file: ${error.message}`);
         return [];
     }
-}
+};
+
+const newAgent = (proxy = null) => {
+    if (proxy && proxy.startsWith('http://')) {
+        const agent = new HttpsProxyAgent(proxy);
+        return agent;
+    } else if (proxy && proxy.startsWith('socks4://')) {
+        const agent = new SocksProxyAgent(proxy);
+        return agent;
+    } else if (proxy && proxy.startsWith('socks5://')) {
+        const agent = new SocksProxyAgent(proxy);
+        return agent;
+    } else {
+        return null;
+    }
+};
 
 class WebSocketClient {
     constructor(token, proxy = null, uuid, reconnectInterval = 5000) {
         this.token = token;
         this.proxy = proxy;
         this.socket = null;
+        this.signature = null;
+        this.timestamp = null;
+        this.url = null;
         this.reconnectInterval = reconnectInterval;
         this.shouldReconnect = true;
-        this.agent = this.proxy ? new HttpsProxyAgent(this.proxy) : null;
+        this.agent = newAgent(proxy)
         this.uuid = uuid;
-        this.url = `wss://api.mygate.network/socket.io/?nodeId=${this.uuid}&EIO=4&transport=websocket`;
-        this.regNode = `40{ "token":"Bearer ${this.token}"}`;
+        this.regNode = `40{"token":"Bearer ${this.token}"}`;
+        this.headers = {
+            "Accept-encoding": "gzip, deflate, br, zstd",
+            "Accept-language": "en-US,en;q=0.9,id;q=0.8",
+            "Cache-control": "no-cache",
+            "Connection": "Upgrade",
+            "Host": "api.mygate.network",
+            "Origin": "chrome-extension://hajiimgolngmlbglaoheacnejbnnmoco",
+            "Pragma": "no-cache",
+            "Sec-Websocket-Extensions": "permessage-deflate; client_max_window_bits",
+            "Upgrade": "websocket",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        }
     }
 
     connect() {
-        if (!this.uuid || !this.url) {
-            log.error("Cannot connect: Node is not registered.");
+        if (!this.uuid) {
+            log.error("Cannot connect: Node is not found.");
             return;
         }
 
-        log.info("Attempting to connect :", this.uuid);
-        this.socket = new WebSocket(this.url, { agent: this.agent });
+        log.info("Attempting to connect:", this.uuid);
+        const sign = getSignature({ nodeId: this.uuid });
+        this.signature = sign.signature;
+        this.timestamp = sign.timestamp;
+        this.url = `wss://api.mygate.network/socket.io/?nodeId=${this.uuid}&signature=${this.signature}&timestamp=${this.timestamp}&version=2&EIO=4&transport=websocket`;
 
-        this.socket.onopen = async () => {
+        if (!this.signature) {
+            log.error(`Failed To get signature...`)
+            return;
+        }
+
+        this.socket = new WebSocket(this.url, { headers: this.headers, agent: this.agent });
+
+        this.socket.onopen = () => {
             log.info("WebSocket connection established for node:", this.uuid);
-            await new Promise(resolve => setTimeout(resolve, 3000));
             this.reply(this.regNode);
         };
 
         this.socket.onmessage = (event) => {
             if (event.data === "2" || event.data === "41") this.socket.send("3");
-            else log.info(`node ${this.uuid} received message:`, event.data);
+            else log.info(`Node ${this.uuid} received message:`, event.data);
         };
 
         this.socket.onclose = () => {
@@ -83,11 +139,12 @@ class WebSocketClient {
     }
 }
 
-async function registerNode(token, proxy = null) {
-    const agent = proxy ? new HttpsProxyAgent(proxy) : null;
-    const maxRetries = 3;
+
+async function registerNode(token, proxy = null, node = null) {
+    const agent = newAgent(proxy)
+    const maxRetries = 5;
     let retries = 0;
-    const uuid = randomUUID();
+    let uuid = node || randomUUID();
     const activationDate = new Date().toISOString();
     const payload = {
         id: uuid,
@@ -95,113 +152,210 @@ async function registerNode(token, proxy = null) {
         activationDate: activationDate,
     };
 
-    try {
-        const response = await fetch("https://api.mygate.network/api/front/nodes", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${token}`,
-            },
-            body: JSON.stringify(payload),
-            agent: agent,
-        });
+    while (retries < maxRetries) {
+        try {
+            const response = await axios.post(
+                "https://api.mygate.network/api/front/nodes",
+                payload,
+                {
+                    headers: {
+                        ...headers,
+                        "Authorization": `Bearer ${token}`,
+                    },
+                    agent: agent,
+                }
+            );
 
-        if (!response.ok) {
-            throw new Error(`Registration failed with status ${response.status}`);
-        }
-        const data = await response.json();
-
-        log.info("Node registered successfully:", data);
-        return uuid;
-
-    } catch (error) {
-        log.error("Error registering node:", error.message);
-        if (retries < maxRetries) {
-            log.info(`Retrying in 10 seconds...`);
-            await new Promise(resolve => setTimeout(resolve, 10000));
+            log.info("Node registered successfully:", response.data);
+            return uuid;
+        } catch (error) {
+            log.error("Error registering node:", error.message);
             retries++;
-            await registerNode(token, proxy);
-        } else {
-            log.error("Max retries exceeded; giving up on registration.");
-            return null;
+            if (retries < maxRetries) {
+                log.info("Retrying in 10 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                log.error("Max retries exceeded; giving up on registration.");
+                return null;
+            }
         }
     }
 }
 
-async function confirmUser(token) {
-    const confirm = await fetch("https://api.mygate.network/api/front/referrals/referral/40gNab?", {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${token}`,
-        },
-        body: JSON.stringify({})
-    });
-    const confirmData = await confirm.json();
-    log.info("Confirm user response:", confirmData);
-}
+async function confirmUser(token, proxy = null) {
+    const agent = newAgent(proxy)
+    try {
+        const response = await axios.post(
+            "https://api.mygate.network/api/front/referrals/referral/LfBWAQ?",
+            {},
+            {
+                headers: {
+                    ...headers,
+                    "Authorization": `Bearer ${token}`,
+                },
+                agent: agent,
+            }
+        );
+        log.info("Confirm user response:", response.data);
+        return null;
+    } catch (error) {
+        log.info("confirming user:", error.message);
+        return null;
+    }
+};
+
+const getQuestsList = async (token, proxy = null) => {
+    const maxRetries = 5;
+    let retries = 0;
+    const agent = newAgent(proxy)
+
+    while (retries < maxRetries) {
+        try {
+            const response = await axios.get("https://api.mygate.network/api/front/achievements/ambassador", {
+                headers: {
+                    ...headers,
+                    "Authorization": `Bearer ${token}`,
+                },
+                agent: agent,
+            });
+            const uncompletedIds = response.data.data.items
+                .filter(item => item.status === "UNCOMPLETED")
+                .map(item => item._id);
+            return uncompletedIds;
+        } catch (error) {
+            retries++;
+            if (retries < maxRetries) {
+                log.info("Retrying in 10 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                log.error("Max retries exceeded; giving up on getting quest info.");
+                return { error: error.message };
+            }
+        }
+    }
+};
+
+async function submitQuest(token, proxy = null, questId) {
+    const maxRetries = 5;
+    let retries = 0;
+    const agent = newAgent(proxy)
+    while (retries < maxRetries) {
+        try {
+            const response = await axios.post(
+                `https://api.mygate.network/api/front/achievements/ambassador/${questId}/submit?`,
+                {},
+                {
+                    headers: {
+                        ...headers,
+                        "Authorization": `Bearer ${token}`,
+                    },
+                    agent: agent,
+                }
+            );
+            log.info("Submit quest response:", response.data);
+            return response.data;
+        } catch (error) {
+            log.error("Error submit quest:", error.message);
+            retries++;
+            if (retries < maxRetries) {
+                log.info("Retrying in 10 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                log.error("Max retries exceeded; giving up on getting quest info.");
+                return { error: error.message };
+            }
+        }
+    }
+};
 
 async function getUserInfo(token, proxy = null) {
-    const maxRetries = 3;
+    const maxRetries = 5;
     let retries = 0;
-    const agent = proxy ? new HttpsProxyAgent(proxy) : null;
-    try {
-        const response = await fetch("https://api.mygate.network/api/front/users/me", {
-            method: "GET",
-            headers: {
-                "Authorization": `Bearer ${token}`,
-            },
-            agent: agent,
-        });
-        if (!response.ok) {
-            log.error(`Failed to get user info with status ${response.status}`);
-            return;
-        }
-        const data = await response.json();
-        const { name, status, _id, levels, currentPoint } = data.data;
-        return { name, status, _id, levels, currentPoint };
-    } catch (error) {
-        if (retries < maxRetries) {
-            log.info(`Retrying in 10 seconds...`);
-            await new Promise(resolve => setTimeout(resolve, 10000));
+    const agent = newAgent(proxy)
+
+    while (retries < maxRetries) {
+        try {
+            const response = await axios.get("https://api.mygate.network/api/front/users/me", {
+                headers: {
+                    ...headers,
+                    "Authorization": `Bearer ${token}`,
+                },
+                agent: agent,
+            });
+            const { name, status, _id, levels, currentPoint } = response.data.data;
+            return { name, status, _id, levels, currentPoint };
+        } catch (error) {
             retries++;
-            await getUserInfo(token, proxy);
-        } else {
-            log.error("Max retries exceeded; giving up on getting user info.");
-            return { error: error.message };
+            if (retries < maxRetries) {
+                log.info("Retrying in 10 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                log.error("Max retries exceeded; giving up on getting user info.");
+                return { error: error.message };
+            }
         }
     }
-}
-async function getUserNode(token, proxy = null) {
-    const maxRetries = 3;
+};
+
+async function getUserNode(token, proxy = null, index) {
+    const maxRetries = 5;
     let retries = 0;
-    const agent = proxy ? new HttpsProxyAgent(proxy) : null;
-    try {
-        const response = await fetch("https://api.mygate.network/api/front/nodes?limit=10&page=1", {
-            method: "GET",
-            headers: {
-                "Authorization": `Bearer ${token}`,
-            },
-            agent: agent,
-        });
-        if (!response.ok) {
-            log.error(`Failed to get user nodes with status ${response.status}`);
-            return;
-        }
-        const data = await response.json();
-        const nodeUUIDs = data.data.items.map(item => item.id);
-        return nodeUUIDs;
-    } catch (error) {
-        if (retries < maxRetries) {
-            log.info(`Retrying in 10 seconds...`);
-            await new Promise(resolve => setTimeout(resolve, 10000));
+    const agent = newAgent(proxy);
+
+    while (retries < maxRetries) {
+        try {
+            const response = await axios.get(
+                "https://api.mygate.network/api/front/nodes?limit=10&page=1",
+                {
+                    headers: {
+                        ...headers,
+                        "Authorization": `Bearer ${token}`,
+                    },
+                    agent: agent,
+                }
+            );
+
+            return response.data.data.items.map(item => item.id);
+        } catch (error) {
             retries++;
-            await getUserNode(token, proxy);
-        } else {
-            log.error("Max retries exceeded; giving up on getting user nodes.");
-            return [];
+
+            if (error.response && error.response.status === 401) {
+                log.error(`Account #${index}:`, 'Unauthorized - please update token');
+                return null;
+            }
+
+            if (retries < maxRetries) {
+                log.info("Retrying in 10 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                log.error("Max retries exceeded; giving up on getting user nodes.");
+                return [];
+            }
         }
     }
-}
+};
+
+
+const checkQuests = async (token, proxy = null) => {
+    log.info('Trying to check for new quests...');
+    const questsIds = await getQuestsList(token, proxy);
+
+    if (questsIds && questsIds.length > 0) {
+        log.info('Found new uncompleted quests:', questsIds.length);
+
+        for (const questId of questsIds) {
+            log.info('Trying to complete quest:', questId);
+            try {
+                await submitQuest(token, proxy, questId);
+                log.info(`Quest ${questId} completed successfully.`);
+            } catch (error) {
+                log.error(`Error completing quest ${questId}:`, error);
+            }
+        }
+    } else {
+        log.info('No new uncompleted quests found.');
+    }
+};
 
 async function main() {
     log.info(bedduSalama);
@@ -211,50 +365,63 @@ async function main() {
     let proxyIndex = 0;
 
     try {
-        for (let i = 0; i < tokens.length; i++) {
-            const token = tokens[i];
+        log.info(`Processing run with total ${tokens.length} accounts`);
+        await Promise.all(tokens.map(async (token, index) => {
+
             const proxy = proxies.length > 0 ? proxies[proxyIndex] : null;
             if (proxies.length > 0) {
                 proxyIndex = (proxyIndex + 1) % proxies.length;
             }
 
-            let nodes = await getUserNode(token, proxy);
-
-            if (nodes && nodes.length > 0) {
-                log.info(`Active user nodes:`, nodes.length);
-            } else {
+            log.info("Trying to get user nodes for account", `#${index + 1}`);
+            let nodes = await getUserNode(token, proxy, index + 1);
+            if (!nodes) return;
+            if (nodes.length === 0) {
                 log.info("This account has no nodes - registering new node...");
                 const uuid = await registerNode(token, proxy);
                 if (!uuid) {
                     log.error("Failed to register node - skipping WebSocket connection.");
-                    continue;
+                    return;
                 }
                 nodes = [uuid];
+            } else {
+                log.info(`Active user nodes for account #${index + 1}:`, nodes.length);
+                await Promise.all(nodes.map(node => registerNode(token, proxy, node)));
             }
 
-            await confirmUser(token);
+            await confirmUser(token, proxy);
             setInterval(async () => {
                 const users = await getUserInfo(token);
-                log.info("User info:", { Active_Nodes: nodes.length, users });
-            }, 15 * 60 * 1000); // Get user info every 15 minutes
+                log.info(`User info for account #${index + 1}:`, { Active_Nodes: nodes.length, users });
+            }, 11 * 60 * 1000); // Get user info every 11 minutes
 
-            for (const node of nodes) {
-                log.info("Trying to open new connection using proxy:", proxy || "No Proxy");
+            await Promise.all(nodes.map(node => {
+                log.info(`Trying to open new connection for account #${index + 1} using proxy:`, proxy || "No Proxy");
                 const client = new WebSocketClient(token, proxy, node);
                 client.connect();
 
                 setInterval(() => {
                     client.disconnect();
-                }, 10 * 60 * 1000); // Auto reconnect node every 10 minutes
-            }
+                }, 10 * 60 * 1000); // Auto reconnect node every 10 minutes 
+            }));
 
-            const users = await getUserInfo(token);
-            log.info("User info:", { Active_Nodes: nodes.length, users });
-        }
+            await checkQuests(token, proxy);
+            setInterval(async () => {
+                try {
+                    await checkQuests(token, proxy);
+                } catch (error) {
+                    log.error(`Error checking quests for account #${index + 1}:`, error.message);
+                }
+            }, 24 * 60 * 60 * 1000); // Check quests every 24 hours
+
+            const users = await getUserInfo(token, proxy);
+            log.info(`User info for account #${index + 1}:`, { Active_Nodes: nodes.length, users });
+        }));
+
         log.info("All accounts connections established - Just leave it running.");
     } catch (error) {
         log.error("Error in WebSocket connections:", error.message);
     }
 }
-//run
+
 main();
